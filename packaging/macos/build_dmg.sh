@@ -17,5 +17,15 @@ trap 'rm -rf "$STAGING"' EXIT
 mkdir -p "$ROOT/dist/installers"
 ditto "$APP" "$STAGING/BICEB.app"
 ln -s /Applications "$STAGING/Applications"
-hdiutil create -volname "BİÇEB $VERSION" -srcfolder "$STAGING" -ov -format UDZO "$OUTPUT"
+for attempt in 1 2 3; do
+  if hdiutil create -volname "BİÇEB $VERSION" -srcfolder "$STAGING" -ov -format UDZO "$OUTPUT"; then
+    break
+  fi
+  rm -f "$OUTPUT"
+  if [[ "$attempt" -eq 3 ]]; then
+    echo "DMG creation failed after three attempts" >&2
+    exit 1
+  fi
+  sleep 5
+done
 echo "$OUTPUT"
