@@ -1,0 +1,113 @@
+name: Build BİÇEB installers
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  installers:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Test calculations and data handling
+        run: python -m pytest -q
+
+      - name: Build Linux executable
+        if: runner.os == 'Linux'
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name BICEB --collect-data biceb main.py
+      - name: Build Linux DEB
+        if: runner.os == 'Linux'
+        run: python packaging/linux/build.py deb
+      - name: Download pinned AppImage build tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl -fL --retry 3 https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -o "$RUNNER_TEMP/appimagetool"
+          curl -fL --retry 3 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64 -o "$RUNNER_TEMP/appimage-runtime"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $RUNNER_TEMP/appimagetool" | sha256sum -c -
+          echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  $RUNNER_TEMP/appimage-runtime" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/appimagetool"
+      - name: Build Linux AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: python packaging/linux/build.py appimage --appimagetool "$RUNNER_TEMP/appimagetool" --runtime-file "$RUNNER_TEMP/appimage-runtime"
+
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name BICEB --icon biceb/resources/biodiversity.ico --collect-data biceb main.pyw
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 --yes --no-progress
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $compiler = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler was not found' }
+          $version = python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])'
+          $script = Get-Content packaging\windows\BICEB.iss -Raw
+          if (-not $script.Contains("#define AppVersion `"$version`"")) { throw 'Inno Setup and Python package versions do not match' }
+          & $compiler.FullName packaging\windows\BICEB.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build macOS application
+        if: runner.os == 'macOS'
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name BICEB --icon biceb/resources/images.png --osx-bundle-identifier org.biceb.desktop --collect-data biceb main.py
+      - name: Build macOS DMG
+        if: runner.os == 'macOS'
+        run: bash packaging/macos/build_dmg.sh
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: BICEB-${{ matrix.os }}
+          path: dist/installers/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Prepare draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: installers
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: BICEB-*
+          path: dist/installers
+          merge-multiple: true
+      - name: Check version and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! compgen -G "dist/installers/biceb_${version}_*.deb" > /dev/null; then
+            echo "Git tag and package version do not match" >&2
+            exit 1
+          fi
+          (cd dist/installers && sha256sum *.deb *.AppImage *.dmg *.exe > SHA256SUMS.txt)
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/installers/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/installers/* --title "BİÇEB $version" --generate-notes --draft
