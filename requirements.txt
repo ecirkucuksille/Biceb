@@ -1,0 +1,3 @@
+# For source checkouts: python -m pip install -e .
+# Dependencies and supported Python versions are defined in pyproject.toml.
+-e .
