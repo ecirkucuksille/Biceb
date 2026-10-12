@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from biceb.core import ANALYSES, compute
+from biceb.core import ANALYSES, compute, requires_integer_counts
 from biceb.data import read_table
 from Classes.GeneralComputations import GeneralComputations
 
@@ -55,3 +55,12 @@ def test_all_registered_analyses_run_on_reference_data(alpha_sample):
         result = compute(analysis.code, alpha_sample)
         assert isinstance(result, pd.DataFrame), analysis.code
         assert len(result) > 0, analysis.code
+
+
+def test_fractional_data_keeps_precision_and_guards_count_formulas():
+    frame = pd.DataFrame({"Species": ["A", "B"], "s1": [37.5, 0.5], "s2": [2.5, 1.5]})
+    assert compute("richness", frame).loc[1, "s1"] == 38.0
+    assert not requires_integer_counts("margalef", frame)
+    assert requires_integer_counts("chao", frame)
+    with pytest.raises(ValueError, match="integer_counts_required"):
+        compute("dependent", frame)

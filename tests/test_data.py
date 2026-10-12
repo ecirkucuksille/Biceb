@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from biceb.data import DataError, export_excel, read_table, validate
+from biceb.data import DataError, export_analyses, export_excel, read_table, validate
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,3 +39,22 @@ def test_invalid_input_is_rejected(data, code):
 def test_legacy_xls_is_readable():
     frame = read_table(ROOT / "sampledata" / "Alfa_Bolluk.xls")
     assert frame.shape[0] > 0
+
+
+def test_fractional_abundances_are_preserved(tmp_path):
+    source = pd.DataFrame({"Species": ["A", "B"], "s1": [37.5, 0.1], "s2": [0, 2.5]})
+    workbook = tmp_path / "fractional.xlsx"
+    source.to_excel(workbook, index=False)
+    frame = read_table(workbook)
+    assert frame["s1"].tolist() == [37.5, 0.1]
+    assert frame["s2"].tolist() == [0.0, 2.5]
+
+
+def test_selected_analyses_export_to_separate_sheets(tmp_path):
+    results = {
+        "richness": pd.DataFrame({"Result": ["S"], "s1": [2]}),
+        "margalef": pd.DataFrame({"Result": ["DMG"], "s1": [0.5]}),
+    }
+    path = export_analyses(results, tmp_path / "selected")
+    assert pd.ExcelFile(path).sheet_names == ["richness", "margalef"]
+    assert pd.read_excel(path, sheet_name="margalef").iat[0, 1] == 0.5
