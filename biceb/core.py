@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import pandas as pd
+import numpy as np
 
 from Classes.DataFrameForBigWindow import DataFrameForBigWindow
 from Classes.PrepareDataFrame import PrepareDataFrame
@@ -44,6 +45,15 @@ ANALYSES = (
 )
 
 BY_CODE = {analysis.code: analysis for analysis in ANALYSES}
+INTEGER_ONLY = frozenset({"chao", "dependent", "independent", "brillouin", "simpson", "jackknife"})
+
+
+def requires_integer_counts(code: str, frame: pd.DataFrame) -> bool:
+    """True when an integer-count formula receives fractional abundances."""
+    if code not in INTEGER_ONLY:
+        return False
+    values = frame.iloc[:, 1:].to_numpy(dtype=float)
+    return not np.equal(values, np.floor(values)).all()
 
 
 def compute(
@@ -55,6 +65,8 @@ def compute(
     """Run an analysis on a snapshot of a validated input table."""
     analysis = BY_CODE[code]
     data = frame.copy(deep=True)
+    if requires_integer_counts(code, data):
+        raise ValueError("integer_counts_required")
     if code.startswith("presence_"):
         data.iloc[:, 1:] = (data.iloc[:, 1:] > 0).astype(int)
     if analysis.kind == "rarefaction":

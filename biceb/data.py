@@ -31,7 +31,7 @@ def read_table(path: str | Path, sheet: str | None = None) -> pd.DataFrame:
 
 
 def validate(frame: pd.DataFrame) -> pd.DataFrame:
-    """Require species names and a finite, nonnegative integer abundance matrix."""
+    """Require species names and finite, nonnegative numeric abundances."""
     if frame is None or frame.shape[0] == 0 or frame.shape[1] < 2:
         raise DataError("empty_table")
     if frame.columns[1:].isna().any() or frame.columns[1:].duplicated().any():
@@ -50,12 +50,21 @@ def validate(frame: pd.DataFrame) -> pd.DataFrame:
         array = values.to_numpy(dtype=float)
         if not np.isfinite(array).all():
             raise DataError(f"invalid_number|{column}")
-        if (array < 0).any() or (array != np.floor(array)).any():
+        if (array < 0).any():
             raise DataError(f"invalid_abundance|{column}")
         if not array.any():
             raise DataError(f"zero_site|{column}")
-        data[column] = values.astype("int64")
+        data[column] = values.astype("int64" if np.equal(array, np.floor(array)).all() else "float64")
     return data
+
+
+def export_analyses(results: dict[str, pd.DataFrame], path: str | Path) -> Path:
+    """Write selected analyses to separate sheets in one workbook."""
+    target = Path(path).with_suffix(".xlsx")
+    with pd.ExcelWriter(target, engine="xlsxwriter") as writer:
+        for code, frame in results.items():
+            frame.to_excel(writer, sheet_name=code[:31], index=False)
+    return target
 
 
 def export_excel(frame: pd.DataFrame, path: str | Path) -> Path:

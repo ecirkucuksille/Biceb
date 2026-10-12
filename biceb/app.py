@@ -1,6 +1,7 @@
 """Cross-platform Qt desktop interface for BİÇEB."""
 
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -8,8 +9,8 @@ import pandas as pd
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from biceb import __version__
-from biceb.core import ANALYSES, BY_CODE, compute
-from biceb.data import DataError, export_excel, read_table, sheets, validate
+from biceb.core import ANALYSES, BY_CODE, compute, requires_integer_counts
+from biceb.data import DataError, export_analyses, export_excel, read_table, sheets, validate
 from biceb.i18n import RESULT_TERMS_EN, error_text, tr
 from biceb.logging_config import configure_logging
 from biceb.theme import STYLE
@@ -91,12 +92,17 @@ class FrameModel(QtCore.QAbstractTableModel):
             parsed = candidate
         else:
             try:
-                parsed = int(candidate)
-                if parsed < 0 or candidate not in (str(parsed), f"+{parsed}"):
+                parsed = float(candidate.replace(",", "."))
+                if not math.isfinite(parsed) or parsed < 0:
                     raise ValueError
+                if parsed.is_integer():
+                    parsed = int(parsed)
             except ValueError:
                 self.invalid_input.emit(f"invalid_abundance|{self.frame.columns[index.column()]}")
                 return False
+            column = self.frame.columns[index.column()]
+            if isinstance(parsed, float) and pd.api.types.is_integer_dtype(self.frame[column].dtype):
+                self.frame[column] = self.frame[column].astype("float64")
         self.frame.iat[index.row(), index.column()] = parsed
         self.dataChanged.emit(index, index, [QtCore.Qt.ItemDataRole.DisplayRole])
         self.changed.emit()
@@ -122,6 +128,29 @@ class AnalysisWorker(QtCore.QObject):
         except Exception as exc:
             LOGGER.exception("Analysis %s failed", self.code)
             self.failed.emit(str(exc))
+
+
+class BatchWorker(QtCore.QObject):
+    completed = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+    progress = QtCore.Signal(int)
+
+    def __init__(self, codes: list[str], frame: pd.DataFrame):
+        super().__init__()
+        self.codes = codes
+        self.frame = frame
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            results = {}
+            for index, code in enumerate(self.codes):
+                results[code] = compute(code, self.frame)
+                self.progress.emit(round((index + 1) * 100 / len(self.codes)))
+            self.completed.emit(results)
+        except Exception as exc:
+            LOGGER.exception("Batch analysis failed at %s", code)
+            self.failed.emit(f"{code}: {exc}")
 
 
 class MetricCard(QtWidgets.QFrame):
@@ -177,9 +206,20 @@ class ResultWindow(QtWidgets.QMainWindow):
         self.chart_button = QtWidgets.QPushButton()
         self.chart_button.setObjectName("Primary")
         self.chart_button.clicked.connect(self.show_chart)
+        self.metric_label = QtWidgets.QLabel()
+        self.metric_box = QtWidgets.QComboBox()
+        if code == "margalef":
+            for row in range(len(frame)):
+                label = str(frame.iat[row, 0])
+                if label != "α*":
+                    self.metric_box.addItem(label, row)
+        self.metric_label.setVisible(code == "margalef")
+        self.metric_box.setVisible(code == "margalef")
         actions.addWidget(self.copy_button)
         actions.addWidget(self.export_button)
         actions.addStretch()
+        actions.addWidget(self.metric_label)
+        actions.addWidget(self.metric_box)
         actions.addWidget(self.chart_button)
         layout.addLayout(actions)
         self.status = self.statusBar()
@@ -193,6 +233,7 @@ class ResultWindow(QtWidgets.QMainWindow):
         self.copy_button.setText(tr(language, "copy"))
         self.export_button.setText(tr(language, "export"))
         self.chart_button.setText(tr(language, "chart"))
+        self.metric_label.setText(tr(language, "chart_metric"))
         self.display = translated_result(self.source, language)
         self.model = FrameModel(self.display, parent=self)
         self.table.setModel(self.model)
@@ -249,11 +290,13 @@ class ResultWindow(QtWidgets.QMainWindow):
                 axis.legend()
                 axis.set_xlabel(tr(self.language, "axis_sites"))
             else:
-                values = numeric.iloc[0]
+                row_index = self.metric_box.currentData() if self.code == "margalef" else 0
+                values = numeric.iloc[row_index]
                 axis.bar([str(label) for label in values.index[:25]], values.iloc[:25], color="#168475")
                 axis.set_xlabel(tr(self.language, "axis_sites"))
             axis.set_ylabel(tr(self.language, "axis_value"))
-            axis.set_title(tr(self.language, self.code), loc="left", fontweight="bold")
+            title = self.metric_box.currentText() if self.code == "margalef" else tr(self.language, self.code)
+            axis.set_title(title, loc="left", fontweight="bold")
             axis.grid(axis="y", alpha=0.2)
             axis.tick_params(axis="x", labelrotation=35)
             box = QtWidgets.QVBoxLayout(dialog)
@@ -276,10 +319,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame = None
         self.file_path = None
         self.selected_code = "richness"
+        self.checked_codes: set[str] = set()
         self.results = []
         self.active_thread = None
         self.active_worker = None
         self.active_code = None
+        self.batch_path = None
         self._close_when_finished = False
         self.setWindowIcon(icon())
         self.resize(1280, 820)
@@ -331,7 +376,7 @@ class MainWindow(QtWidgets.QMainWindow):
         body.setSpacing(16)
         sidebar = QtWidgets.QFrame()
         sidebar.setObjectName("Panel")
-        sidebar.setFixedWidth(280)
+        sidebar.setFixedWidth(310)
         sidebar_layout = QtWidgets.QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(12, 16, 12, 12)
         self.analyses_label = QtWidgets.QLabel()
@@ -341,8 +386,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(13)
         self.tree.itemSelectionChanged.connect(self.select_analysis)
-        self.tree.itemDoubleClicked.connect(lambda *_: self.run_analysis())
+        self.tree.itemChanged.connect(self._check_analysis)
+        self.tree.itemDoubleClicked.connect(self._tree_double_clicked)
         sidebar_layout.addWidget(self.tree)
+        self.batch_hint = QtWidgets.QLabel()
+        self.batch_hint.setObjectName("Muted")
+        self.batch_hint.setWordWrap(True)
+        sidebar_layout.addWidget(self.batch_hint)
         body.addWidget(sidebar)
 
         content = QtWidgets.QVBoxLayout()
@@ -413,6 +463,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_button.setObjectName("Primary")
         self.run_button.clicked.connect(self.run_analysis)
         bottom_layout.addWidget(self.run_button)
+        self.batch_button = QtWidgets.QPushButton()
+        self.batch_button.clicked.connect(self.export_selected_analyses)
+        bottom_layout.addWidget(self.batch_button)
         content.addWidget(bottom)
         self.hint = QtWidgets.QLabel()
         self.hint.setObjectName("Muted")
@@ -445,6 +498,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_label.setText(tr(language, "selected"))
         self.selected_title.setText(tr(language, self.selected_code))
         self.run_button.setText(tr(language, "run"))
+        self.batch_button.setText(tr(language, "batch_export"))
+        self.batch_hint.setText(tr(language, "batch_hint"))
         self.hint.setText(tr(language, "hint"))
         self.file_label.setText(self.file_path.name if self.file_path else tr(language, "no_file"))
         self.empty.setText(tr(language, "start_title") + "\n" + tr(language, "start_text"))
@@ -458,19 +513,50 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_tree(self):
         self.tree.blockSignals(True)
         self.tree.clear()
-        for group in ("alpha", "indices", "abundance", "beta"):
-            parent = QtWidgets.QTreeWidgetItem([tr(self.language, group)])
+        alpha = QtWidgets.QTreeWidgetItem([tr(self.language, "alpha")])
+        beta = QtWidgets.QTreeWidgetItem([tr(self.language, "beta")])
+        for parent in (alpha, beta):
             parent.setFlags(parent.flags() & ~QtCore.Qt.ItemFlag.ItemIsSelectable)
             self.tree.addTopLevelItem(parent)
+        for group in ("alpha", "indices", "abundance"):
+            key = "richness_group" if group == "alpha" else group
+            parent = QtWidgets.QTreeWidgetItem([tr(self.language, key)])
+            parent.setFlags(parent.flags() & ~QtCore.Qt.ItemFlag.ItemIsSelectable)
+            alpha.addChild(parent)
             for analysis in ANALYSES:
                 if analysis.group_key == group:
-                    child = QtWidgets.QTreeWidgetItem([tr(self.language, analysis.title_key)])
-                    child.setData(0, QtCore.Qt.ItemDataRole.UserRole, analysis.code)
-                    parent.addChild(child)
-                    if analysis.code == self.selected_code:
-                        self.tree.setCurrentItem(child)
+                    self._add_analysis_item(parent, analysis.code, checkable=True)
             parent.setExpanded(True)
+        for analysis in ANALYSES:
+            if analysis.group_key == "beta":
+                self._add_analysis_item(beta, analysis.code, checkable=False)
+        alpha.setExpanded(True)
+        beta.setExpanded(True)
         self.tree.blockSignals(False)
+
+    def _add_analysis_item(self, parent: QtWidgets.QTreeWidgetItem, code: str, checkable: bool):
+        child = QtWidgets.QTreeWidgetItem([tr(self.language, code)])
+        child.setData(0, QtCore.Qt.ItemDataRole.UserRole, code)
+        if checkable:
+            child.setFlags(child.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            state = QtCore.Qt.CheckState.Checked if code in self.checked_codes else QtCore.Qt.CheckState.Unchecked
+            child.setCheckState(0, state)
+        parent.addChild(child)
+        if code == self.selected_code:
+            self.tree.setCurrentItem(child)
+
+    def _check_analysis(self, item: QtWidgets.QTreeWidgetItem, _column: int):
+        code = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if code not in BY_CODE or BY_CODE[code].group_key == "beta":
+            return
+        if item.checkState(0) == QtCore.Qt.CheckState.Checked:
+            self.checked_codes.add(code)
+        else:
+            self.checked_codes.discard(code)
+
+    def _tree_double_clicked(self, item: QtWidgets.QTreeWidgetItem, _column: int):
+        if item.data(0, QtCore.Qt.ItemDataRole.UserRole):
+            self.run_analysis()
 
     def change_language(self):
         self.language = self.language_box.currentData()
@@ -506,7 +592,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.species_card.value.setText(str(len(self.frame)))
         self.sites_card.value.setText(str(len(self.frame.columns) - 1))
-        self.individuals_card.value.setText(f"{int(self.frame.iloc[:, 1:].to_numpy().sum()):,}".replace(",", " "))
+        total = float(self.frame.iloc[:, 1:].to_numpy().sum())
+        self.individuals_card.value.setText(f"{total:,.10f}".rstrip("0").rstrip(".").replace(",", " "))
 
     def _replace_frame(self, frame: pd.DataFrame):
         self.frame = frame.reset_index(drop=True)
@@ -604,7 +691,11 @@ class MainWindow(QtWidgets.QMainWindow):
         except DataError as exc:
             self._show_error(error_text(self.language, str(exc)))
             return
+        if requires_integer_counts(code, snapshot):
+            self._show_error(tr(self.language, "integer_counts_required"))
+            return
         self.run_button.setEnabled(False)
+        self.batch_button.setEnabled(False)
         self.open_button.setEnabled(False)
         self.table.setEnabled(False)
         self.add_species_button.setEnabled(False)
@@ -630,6 +721,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active_code = code
         thread.start()
 
+    def export_selected_analyses(self):
+        if self.active_thread is not None:
+            return
+        if self.frame is None:
+            self._show_error(tr(self.language, "select_data"))
+            return
+        codes = [analysis.code for analysis in ANALYSES if analysis.code in self.checked_codes]
+        if not codes:
+            self._show_error(tr(self.language, "batch_empty"))
+            return
+        try:
+            snapshot = validate(self.frame)
+        except DataError as exc:
+            self._show_error(error_text(self.language, str(exc)))
+            return
+        incompatible = [code for code in codes if requires_integer_counts(code, snapshot)]
+        if incompatible:
+            names = ", ".join(tr(self.language, code) for code in incompatible)
+            self._show_error(f"{tr(self.language, 'integer_counts_required')}\n{names}")
+            return
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, tr(self.language, "batch_export"), "", tr(self.language, "save_filter")
+        )
+        if not filename:
+            return
+        self.batch_path = filename
+        self.run_button.setEnabled(False)
+        self.batch_button.setEnabled(False)
+        self.open_button.setEnabled(False)
+        self.table.setEnabled(False)
+        self.add_species_button.setEnabled(False)
+        self.add_site_button.setEnabled(False)
+        self.remove_button.setEnabled(False)
+        self.progress.setValue(0)
+        self.progress.show()
+        self.statusBar().showMessage(tr(self.language, "batch_export") + "…")
+        thread = QtCore.QThread(self)
+        worker = BatchWorker(codes, snapshot)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.progress.setValue)
+        worker.completed.connect(self._batch_done_current)
+        worker.failed.connect(self._analysis_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._worker_finished)
+        self.active_thread = thread
+        self.active_worker = worker
+        self.active_code = "batch"
+        thread.start()
+
+    @QtCore.Slot(object)
+    def _batch_done_current(self, results: dict[str, pd.DataFrame]):
+        try:
+            translated = {code: translated_result(frame, self.language) for code, frame in results.items()}
+            path = export_analyses(translated, self.batch_path)
+            LOGGER.info("Exported %d analyses to %s", len(results), path)
+            self.statusBar().showMessage(tr(self.language, "export_done", path=path), 7000)
+        except Exception as exc:
+            LOGGER.exception("Could not export selected analyses")
+            self._show_error(tr(self.language, "export_error", detail=exc))
+
     @QtCore.Slot(object)
     def _analysis_done_current(self, result: pd.DataFrame):
         code = self.active_code
@@ -641,13 +796,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _analysis_failed(self, detail: str):
+        code, separator, message = detail.partition(": ")
+        if separator and message == "integer_counts_required":
+            detail = f"{tr(self.language, code)}: {tr(self.language, message)}"
+        else:
+            detail = error_text(self.language, detail)
         self._show_error(tr(self.language, "analysis_error", detail=detail))
 
     def _worker_finished(self):
         self.active_thread = None
         self.active_worker = None
         self.active_code = None
+        self.batch_path = None
         self.run_button.setEnabled(True)
+        self.batch_button.setEnabled(True)
         self.open_button.setEnabled(True)
         self.table.setEnabled(True)
         self.add_species_button.setEnabled(True)
